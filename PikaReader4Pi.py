@@ -16,11 +16,19 @@
 #  along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
 
+######
+# TODO:
+# Antenna Status: - Use "-" for disabled ports (not "X")
+# Trigger Input: Display trigger time for 3 seconds
+# Battery level via i2c voltage sensor (INA237?)
+# Beep / Buzzer on read
+
 ########
 # Modify before using!
-# Update the GPIO Assignments section below
-# Update the command to start PikaReader
-#
+#  - Update the GPIO Assignments section below
+#  - Update the command to start PikaReader
+#  - Review Chronyc and gpscsv commands to snag ntp and gps status
+
 
 import socket
 import asyncio
@@ -38,15 +46,21 @@ import requests
 
 
 ###### 
-# GPIO Assignments
-BTN_START_READING = 16
-BTN_TRIGGER = 18
-LED_READING = 36 # GREEN
+# GPIO pin assignments
+# These are PHYSICAL pin numbers, not logical!
+BTN_START_READING = 16 # gpio 4
+BTN_TRIGGER = 18 # gpio 5
+LED_READING = 36 # gpio 27
+BUZZER = 37 # gpio 25
 
 #####
+# OS Commands
+# NTP Stratum
+# GPS Lock
 # PikaReader Start command
-PIKAREADER_START_CMD = "java -jar /opt/PikaReader/bin/PikaReader-0.6.jar > /tmp/pika.out &"
-
+PIKAREADER_START_CMD = "java -jar /opt/PikaReader/bin/PikaReader-0.6.1.jar > /tmp/pika.out &"
+NTP_STRATUM_CMD = "chronyc  tracking | grep Stratum | awk \'{print $3}\'"
+GPS_STATUS_CMD = "gpscsv -f mode -n 1 --header 0"
 
 ######
 #
@@ -101,10 +115,10 @@ def timesync_check():
     lcd_write(0, 2, time.center(20))
     print(now.strftime("%m/%d/%Y  %H:%M:%S.%f"))
 
-    ntp_stratum = int(os.popen("chronyc  tracking | grep Stratum | awk \'{print $3}\'").read().strip())
+    ntp_stratum = int(os.popen(NTP_STRATUM_CMD).read().strip())
 
     if int(now.timestamp()) % 2 > 0: 
-        gps_lock = int(os.popen("gpscsv -f mode -n 1 --header 0").read().strip())
+        gps_lock = int(os.popen(GPS_STATUS_CMD).read().strip())
 
     status = f"NTP:{ntp_stratum} GPS:{gps_lock}"
     lcd_write(0, 3, status.center(20))
@@ -136,7 +150,7 @@ def timecheck_abort(channel):
 
 # The RSSI values are typically -100 (nothing) to -20 (really, really good)
 # So we will just add 100 to deal with positive numbers from 0 -> 80
-# With two charachters, there are 18 possible levels (from all blank to all filled)
+# With two characters, there are 18 possible levels (from all blank to all filled)
 #
 # The rssi is the raw rssi
 # the position is if this is the top char or the bottom one.
@@ -145,10 +159,6 @@ def pwr_map(rssi, position):
 
     if position == "T":
         rssi -= 40
-
-    if rssi <= 0: return " "
-
-    return chr(int(rssi // 5) - 1)
 
     match rssi:
         case x if x > 35:
@@ -263,7 +273,7 @@ def reading_button_callback(channel):
             print("Stopping Readers...")
             with lcd_lock:
                 LCD2004.write(0,2,"Stopping".center(20))
-                LCD2004.write(0,3,"Readers... ".center(20))
+                LCD2004.write(0,3,"Readers...".center(20))
                 response = requests.get('http://localhost:8080/stop')
                 print(response.text)
                 time.sleep(2)
@@ -276,19 +286,19 @@ def reading_button_callback(channel):
 
         with lcd_lock:
             LCD2004.write(0,2,"Starting".center(20))
-            LCD2004.write(0,3,"Readers... ".center(20))
+            LCD2004.write(0,3,"Readers...".center(20))
 
             response = requests.get('http://localhost:8080/start')
             print(response.text)
             time.sleep(2)
 
+# Now that we know what to do, wire it into the gpio pin
+GPIO.add_event_detect(BTN_START_READING,GPIO.FALLING,callback=reading_button_callback,bouncetime=500)
 
-
-GPIO.add_event_detect(BTN_START_READING,GPIO.FALLING,callback=reading_button_callback,bouncetime=500) # Setup event callback
 
 ###
 # Step 3:
-# Set background thread to monitor the websocket to PikaReader
+# Start a background thread to monitor the websocket to PikaReader
 # 
 async def ws_event_monitor():
     global last_chip_read
@@ -310,12 +320,6 @@ async def ws_event_monitor():
                     event = json.loads(message)
                     #print(f"Received: {message}")
 
-                    # If we have a read event
-                    if event["type"] == "READ":
-                        last_chip_read = event["chip"] 
-                        read_count += 1
-                        #print(f"RC: {read_count} LC:{last_chip_read}")
-
                     # update the unitID
                     if event["type"] == "STATUS" and not event["reading"]:
                         #print("Status: Idle")
@@ -327,38 +331,26 @@ async def ws_event_monitor():
                            unitID = event["unitID"]
                            lcd_write(0,0,unitID)
                         
-                        # get the status for reader 1
-                        r1 = event["readers"][0]
-                        if r1["connected"]:
-                            lcd_write(0,2,"R1 READY ")
-                            ant="ANT: "
-                            for p in r1["portStatus"]:
-                                if r1["portStatus"][p] == "Disconnected":
-                                    ant = ant + "x"
-                                else: 
-                                    ant = ant + "C"
-                            lcd_write(9,2,ant)
+                        # get the status for readers
+                        for i in range(2):
+                            line = ""
+                            if len(event["readers"]) > i:
+                                r = event["readers"][i]
+                                if r["connected"]:
+                                    line=f"R{i+1} READY ANT: "
 
-                        else:
-                            lcd_write(0,2,"R1 ERROR     ")
+                                    for p in r["portStatus"]:
+                                        if r["portStatus"][p] == "Disconnected":
+                                            line = line + "X"
+                                        elif r["portStatus"][p] == "Disabled":
+                                            line = line + "-"
+                                        else:
+                                            line = line + "C"
+                                else:
+                                    line=f"R{i+1} ERROR"
 
-                        # get the status for reader 2
-                        # (if it exists)
-                        if len(event["readers"]) > 1: 
-                            r2 = event["readers"][1]
-                       
-                            if r1["connected"]:
-                                lcd_write(0,3,"R2 READY ")
-                                ant="ANT: "
-                                for p in r2["portStatus"]:
-                                    if r2["portStatus"][p] == "Disconnected":
-                                        ant = ant + "x"
-                                    else: 
-                                        ant = ant + "C"
-                                lcd_write(9,3,ant)
-                            else:
-                                lcd_write(0,3,"R2 ERROR      ")
-                        else: lcd_write(0,3,"                    ")
+                            lcd_write(0,i+2,f"{line:20}")
+
 
                     elif event["type"] == "STATUS" and event["reading"]:
                         #print("Status: Reading")
@@ -370,8 +362,12 @@ async def ws_event_monitor():
                            lcd_write(0,0,unitID)
 
                         # update the read count and last chip read
+                        if "lastChipRead" in event: last_chip_read = event["lastChipRead"]
+                        if "totalReads" in event: read_count = event["totalReads"]
                         if l_last_chip_read != last_chip_read or l_read_count != read_count:
-                            lcd_write(11,3,f"{last_chip_read:>9}")
+                            if read_count > 99999: read_count = 99999
+
+                            lcd_write(11,3,f"{last_chip_read:>9.9}")
                             lcd_write(15,2,f"{read_count:>5}")
                             l_last_chip_read = last_chip_read
                             l_read_count = read_count
@@ -380,54 +376,48 @@ async def ws_event_monitor():
                         pwr1 = ""
                         pwr2 = ""
 
-                        if len(event["readers"] )> 0:
-                            r1 = event["readers"][0]
-                            r1_name = r1["name"]
+                        for i in range(2):
 
-                            pwr1 = pwr1 + "R"
-                            pwr2 = pwr2 + "1"
-                            r1_stats = event["readerPortStats"][r1_name]
-                            for i,s in enumerate(r1_stats["status"]):
-                                if s == "Disconnected":
+                            if len(event["readers"] )> i:
+                                r1 = event["readers"][i]
+                                r1_name = r1["name"]
+
+                                if i > 0:
                                     pwr1 = pwr1 + " "
-                                    pwr2 = pwr2 + "x"
-                                else:
-                                    pwr1 = pwr1 + pwr_map(r1_stats["readStrength"][i],"T")
-                                    pwr2 = pwr2 + pwr_map(r1_stats["readStrength"][i],"B")
+                                    pwr2 = pwr2 + " "
 
-                        if len(event["readers"] )> 1:
-                            r1 = event["readers"][1]
-                            r1_name = r1["name"]
+                                pwr1 = pwr1 + "R"
+                                pwr2 = pwr2 + f"{i+1}"
+                                r1_stats = event["readerPortStats"][r1_name]
+                                for i,s in enumerate(r1_stats["status"]):
+                                    if s == "Disconnected":
+                                        pwr1 = pwr1 + " "
+                                        pwr2 = pwr2 + "x"
+                                    elif s == "Disabled":
+                                        pwr1 = pwr1 + " "
+                                        pwr2 = pwr2 + "-"
+                                    else:
+                                        pwr1 = pwr1 + pwr_map(r1_stats["readStrength"][i],"T")
+                                        pwr2 = pwr2 + pwr_map(r1_stats["readStrength"][i],"B")
 
-                            pwr1 = pwr1 + " R"
-                            pwr2 = pwr2 + " 2"
-                            r1_stats = event["readerPortStats"][r1_name]
-                            for i,s in enumerate(r1_stats["status"]):
-                                if s == "Disconnected":
-                                    pwr1 = pwr1 + " "
-                                    pwr2 = pwr2 + "x"
-                                else:
-                                    pwr1 = pwr1 + pwr_map(r1_stats["readStrength"][i],"T")
-                                    pwr2 = pwr2 + pwr_map(r1_stats["readStrength"][i],"B")
+                        lcd_write(0,2,f"{pwr1:11}")
+                        lcd_write(0,3,f"{pwr2:11}")
 
-                        lcd_write(0,2,pwr1)
-                        lcd_write(0,3,pwr2)
-
-
- 
                     elapsed_time = time.time() - start_time
                     #print(f"WS Processing Time: {elapsed_time}")
 
         #except (websockets.WebSocketException, ConnectionRefusedError):
         # There is just way too much stuff that can go wrong here....
         # So let's just sleep for a bit and retry.
-        except:
+        except Exception as ex:
+            print(f"Exception: {ex}")
             print("Connection lost. Reconnecting in 5 seconds...")
             await asyncio.sleep(5)
 
 def websocket_monitor():
     asyncio.run(ws_event_monitor())
 
+# Start the background thread to monitor the websocket
 ws_thread=threading.Thread(target=websocket_monitor,daemon=True)
 ws_thread.start()
 
@@ -452,11 +442,13 @@ try:
         my_ip = ip
         lcd_write(7,0,f"{my_ip:>13}")
 
-        ntp_stratum = int(os.popen("chronyc  tracking | grep Stratum | awk \'{print $3}\'").read().strip())
-        if ntp_stratum == 1: 
-            lcd_write(11,1,'G')
-        else:
-            lcd_write(11,1,'N')
+        ntp_stratum = int(os.popen(NTP_STRATUM_CMD).read().strip())
+        if ntp_stratum == 1: # we have a pps/gps timesync
+            lcd_write(11,1,'g')
+        elif ntp_stratum == 0: # no real sync
+            lcd_write(11,1,'x')
+        else: # we have a sync from a remote ntp server
+            lcd_write(11,1,'n')
             
     sleep_time = start_time + 1 - time.time()
     #print(f"sleeping {sleep_time}")
@@ -471,5 +463,7 @@ finally:
     print("Cleanup GPIO...")
     os.popen("pkill java")
     GPIO.cleanup()
-    clear_lcd()
     print("Goodbye!")
+    time.sleep(1)
+    clear_lcd()
+    lcd_write(0,1,"Goodbye!".center(20))
