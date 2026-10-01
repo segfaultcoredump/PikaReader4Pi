@@ -18,7 +18,18 @@
 
 ######
 # TODO:
+# Implement the python logging facility: write to /tmp, keep past 10 runs.
 # Show "0" and "No Reads" if we are in reading mode and don't have any reads yet
+# Verify battery sampling stability and shorten the window if possible
+# Send GPS -> external status every minute if ntp shows we have a lock
+# Document port usage better (I2C, Serial #1, Serial #2, etc)
+# Move trigger to unused gpio to free up 2nd serial port
+# Move end user modifications to 2nd file
+# Create update script that syncs from github
+# Figure out a better way to lock the LCD for "starting..." and "stopping..." messages
+# verify trigger no longer locks up the lcd
+# verify stopping no longer locks up the lcd
+# Add 0.2s holddown on start to prevent a momentary short from starting the system
 
 ########
 # Modify before using!
@@ -32,7 +43,7 @@
 # These are PHYSICAL pin numbers, not logical!
 BTN_START_READING = 40  # gpio 21
 BTN_TRIGGER = 35  # gpio 19
-LED_READING = 36  # gpio 27
+LED_READING = 36  # gpio 16
 BUZZER = 33 # gpio 13 / PWM1
 
 
@@ -42,12 +53,16 @@ BUZZER = 33 # gpio 13 / PWM1
 # NTP Stratum
 # GPS Lock
 
-PIKAREADER_START_CMD = "java -jar /opt/PikaReader/bin/PikaReader-0.6.1.jar > /tmp/pika.out &"
+PIKAREADER_START_CMD = "java -jar /opt/PikaReader/bin/PikaReader.jar > /tmp/pika.out &"
+PIKAREADER_PORT = 8080
 NTP_STRATUM_CMD = "chronyc  tracking | grep Stratum | awk \'{print $3}\'"
 GPS_STATUS_CMD = "gpscsv -f mode -n 1 --header 0" # set to "echo 0" if you don't have a gps
 
 # Battery Size
 BATTERY_CAP_WH = 160 # in Watt-Hours
+
+# Status file location
+STATUS_FILE = "/tmp/pikareader.status"
 
 ###
 # Beeper volume (0 for off, 100 for loud)
@@ -151,6 +166,17 @@ def init_ina237(bus, addr):
     bus.write_word_data(addr, REG_CONFIG, 0x0000)
     time.sleep(0.01)
 
+    # 2. Setup ADC Config Register for Stability
+    # Bits 0 -> 2: AVG (256 samples) = 101
+    # Bits 3 - 5: VTCT (1.052ms) = 0b101
+    # Bits 6 -> 8: VSHCT (1.052ms)   = 0b101
+    # bits 9 -> 11: VBUSCT (1.052ms)  = 0b101
+    # Bits 12 -> 15: MODE (Continuous) = 0b1111
+    # Total ADC_CFG Value = 0xFB6D
+    # Default is 0xFCDH which sets AVG to 1 sample
+    adc_config_val = 0xFB6D
+    bus.write_word_data(addr, REG_ADC_CONFIG, adc_config_val)
+    time.sleep(0.01)
 
 
 ###
@@ -197,8 +223,18 @@ def set_reading_status(s):
 
 def lcd_write(x,y,str):
    global lcd_lock
-   with lcd_lock:
-      LCD2004.write(x,y,str)
+   # with lcd_lock:
+   #   LCD2004.write(x,y,str)
+
+   acquired = lcd_lock.acquire(timeout=0.5)
+
+   if acquired:
+       try:
+           LCD2004.write(x,y,str)
+       finally:
+           lcd_lock.release()
+   else:
+       print("lcd_write: Failed to acquire lock: operation timed out.")
 
 
 def timesync_check():
@@ -288,6 +324,10 @@ def battery_monitor_thread():
             if sec < 2: lcd_write(0,1, f"ETA:{eta}")
             else: lcd_write(0,1, f"BAT:{cap:>3}%")
 
+            batt_status = {"BATTERY":cap,"RUNTIME_REMAINING":eta}
+            with open(STATUS_FILE, "w", encoding="utf-8") as file:
+                json.dump(batt_status, file)
+
             time.sleep(1)
 
     except KeyboardInterrupt:
@@ -348,16 +388,19 @@ def setup_custom_lcd_chars():
     LCD2004.create_char(7, bytes([0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F]))
 
 def trigger_button_callback(channel):
+    global lcd_lock
     do_beep()
     print("Trigger Button Pressed!")
-    response = requests.get('http://localhost:8080/trigger')
+    response = requests.get(f"http://localhost:{PIKAREADER_PORT}/trigger")
     print(response.text)
     event = json.loads(response.text)
     timestamp = event["timestamp"].split()
     with lcd_lock:
         LCD2004.write(0, 2, "Trigger Pressed".center(20))
         LCD2004.write(0, 3, timestamp[1].center(20))
-        time.sleep(3)
+        time.sleep(2)
+        LCD2004.write(0, 2, " ".center(20))
+        LCD2004.write(0, 3, " ".center(20))
 
 def reading_button_callback(channel):
     global reading_status
@@ -370,10 +413,8 @@ def reading_button_callback(channel):
     if reading_status:
 
         button_start_time = time.time()
-
         while GPIO.input(BTN_START_READING) == 0:
             pass
-
         button_time = time.time() - button_start_time
 
         print(f"Stop Button time {button_time}")
@@ -384,35 +425,48 @@ def reading_button_callback(channel):
             with lcd_lock:
                 LCD2004.write(0, 2, "Stopping".center(20))
                 LCD2004.write(0, 3, "Readers...".center(20))
-                response = requests.get('http://localhost:8080/stop')
+                response = requests.get(f"http://localhost:{PIKAREADER_PORT}/stop")
                 print(response.text)
                 time.sleep(2)
+                LCD2004.write(0, 2, " ".center(20))
+                LCD2004.write(0, 3, " ".center(20))
 
             read_count = 0
             last_chip_read = ""
 
     else:
-        do_beep()
-        print("Starting Readers...")
+        # Start if the button is held down for more than 0.1 seconds
+        # prevents random bumps from starting the unit
+        button_start_time = time.time()
 
-        with lcd_lock:
-            LCD2004.write(0, 2, "Starting".center(20))
-            LCD2004.write(0, 3, "Readers...".center(20))
+        while GPIO.input(BTN_START_READING) == 0:
+            pass
 
-            response = requests.get('http://localhost:8080/start')
-            print(response.text)
-            time.sleep(2)
+        button_time = time.time() - button_start_time
+
+        if button_time >= 0.1:
+            do_beep()
+            print("Starting Readers...")
+            with lcd_lock:
+                LCD2004.write(0, 2, "Starting".center(20))
+                LCD2004.write(0, 3, "Readers...".center(20))
+
+                response = requests.get(f"http://localhost:{PIKAREADER_PORT}/start")
+                print(response.text)
+                time.sleep(2)
+                LCD2004.write(0, 2, " ".center(20))
+                LCD2004.write(0, 3, " ".center(20))
 
 
-async def ws_event_monitor():
+async def ws_status_monitor():
     global last_chip_read
     global read_count
 
     l_last_chip_read = ""
     l_read_count = -1
 
-    uri = "ws://localhost:8080/events"
-    unitID = "Pika01"
+    uri = f"ws://localhost:{PIKAREADER_PORT}/status"
+    unitID = "PikaR"
     while True:
         try:
             async with websockets.connect(uri) as websocket:
@@ -470,11 +524,12 @@ async def ws_event_monitor():
                         # update the read count and last chip read
                         if "lastChipRead" in event: last_chip_read = event["lastChipRead"]
                         if "totalReads" in event: read_count = event["totalReads"]
+                        if read_count == 0: last_chip_read = "No Reads"
                         if l_last_chip_read != last_chip_read or l_read_count != read_count:
-                            if read_count > 99999: read_count = 99999
+                            if read_count > 999999: read_count = " 100K+"
 
-                            lcd_write(11, 3, f"{last_chip_read:>9.9}")
-                            lcd_write(15, 2, f"{read_count:>5}")
+                            lcd_write(12, 2, f"R:{read_count:>6.6}")
+                            lcd_write(12, 3, f"{last_chip_read:>8.8}")
                             l_last_chip_read = last_chip_read
                             l_read_count = read_count
 
@@ -522,7 +577,7 @@ async def ws_event_monitor():
 
 
 def websocket_monitor():
-    asyncio.run(ws_event_monitor())
+    asyncio.run(ws_status_monitor())
 
 
 ###
@@ -594,7 +649,7 @@ print("Started WebSocket Monitor")
 
 ###
 # Step 5:
-# Start a background thread to connect to monitor the battery level
+# Start a background thread to monitor the battery level
 #
 bat_thread=threading.Thread(target=battery_monitor_thread, daemon=True)
 bat_thread.start()
@@ -624,11 +679,13 @@ try:
 
         ntp_stratum = int(os.popen(NTP_STRATUM_CMD).read().strip())
         if ntp_stratum == 1: # we have a pps/gps timesync
-            lcd_write(11,1,'g')
+            lcd_write(11,1,'G')
         elif ntp_stratum == 0: # no real sync
-            lcd_write(11,1,'x')
+            lcd_write(11,1,'X')
+        elif ntp_stratum == 8: # local clock
+            lcd_write(11,1,'L')
         else: # we have a sync from a remote ntp server
-            lcd_write(11,1,'n')
+            lcd_write(11,1,'N')
             
     sleep_time = start_time + 1 - time.time()
     #print(f"sleeping {sleep_time}")
