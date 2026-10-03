@@ -174,7 +174,7 @@ def init_ina237(bus, addr):
     # Bits 12 -> 15: MODE (Continuous) = 0b1111
     # Total ADC_CFG Value = 0xFB6D
     # Default is 0xFCDH which sets AVG to 1 sample
-    adc_config_val = 0xFB6D
+    adc_config_val = 0xDFAC # 4.12ms conversion times, 64x sampling, disable temp
     bus.write_word_data(addr, REG_ADC_CONFIG, adc_config_val)
     time.sleep(0.01)
 
@@ -528,7 +528,7 @@ async def ws_status_monitor():
                         if l_last_chip_read != last_chip_read or l_read_count != read_count:
                             if read_count > 999999: read_count = " 100K+"
 
-                            lcd_write(12, 2, f"R:{read_count:>6.6}")
+                            lcd_write(12, 2, f"R:{read_count:>6}")
                             lcd_write(12, 3, f"{last_chip_read:>8.8}")
                             l_last_chip_read = last_chip_read
                             l_read_count = read_count
