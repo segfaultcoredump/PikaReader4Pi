@@ -73,7 +73,7 @@ BEEPER_READ_VOL = 40
 I2C_BUS = 1
 DEVICE_ADDR = 0x40  # Replace with your specific INA237 I2C address
 R_SHUNT = 0.015  # 0.015 Ohms (15 mOhms)
-WINDOW_SIZE = 10  # Average window length in seconds
+WINDOW_SIZE = 15  # Average window length in seconds
 
 #####
 #
@@ -117,9 +117,43 @@ def estimate_remaining_capacity(voltage: float) -> float:
     Calculates the approximate remaining capacity (%) of a 7S LiPo pack
     based on its resting voltage using linear interpolation.
     """
-    # Reference data points from the 7S LiPo chart: (Voltage, Capacity %)
-    voltage_points = [21.0, 25.2, 26.0, 26.6, 27.3, 29.4]
-    capacity_points = [0.0, 10.0, 25.0, 50.0, 75.0, 100.0]
+    # 7S LiPO pack voltage points (Sorted for np.interp)
+    # Additional steps below 40% to capture the discharge knee accurately.
+    # Uniform 5% steps from 40% to 100%.
+    voltage_points = np.array([
+        21.00,  # 0%   (3.00V / cell) - Safe floor
+        23.10,  # 5%   (3.30V / cell)
+        24.50,  # 10%  (3.50V / cell) - Drop-off zone start
+        24.71,  # 12%  (3.53V / cell)
+        24.92,  # 15%  (3.56V / cell)
+        25.13,  # 18%  (3.59V / cell)
+        25.27,  # 20%  (3.61V / cell)
+        25.41,  # 23%  (3.63V / cell)
+        25.55,  # 25%  (3.65V / cell)
+        25.69,  # 28%  (3.67V / cell)
+        25.76,  # 30%  (3.68V / cell)
+        25.90,  # 35%  (3.70V / cell) - Drop-off zone end
+        26.25,  # 40%  (3.75V / cell)
+        26.39,  # 45%  (3.77V / cell)
+        26.53,  # 50%  (3.79V / cell) - Storage voltage
+        26.60,  # 55%  (3.80V / cell)
+        26.74,  # 60%  (3.82V / cell)
+        27.06,  # 65%  (3.87V / cell)
+        27.37,  # 70%  (3.91V / cell)
+        27.69,  # 75%  (3.96V / cell)
+        28.00,  # 80%  (4.00V / cell)
+        28.35,  # 85%  (4.05V / cell)
+        28.70,  # 90%  (4.10V / cell)
+        29.05,  # 95%  (4.15V / cell)
+        29.40  # 100% (4.20V / cell) - Fully Charged
+    ])
+
+    # Corresponding remaining capacity percentages (0.0 to 1.0)
+    capacity_points = np.array([
+        0.0, 5.0, 10.0, 12.0, 15.0, 18.0, 20.0, 23.0, 25.0, 28.0, 30.0, 35.0,
+        40.0, 45.0, 50.0, 55.0, 60.0, 65.0, 70.0, 75.0, 80.0, 85.0, 90.0, 95.0,
+        100.0
+    ])
 
     # Clamp voltage within absolute safe physical limits
     if voltage >= 29.4:
@@ -167,15 +201,22 @@ def init_ina237(bus, addr):
     time.sleep(0.01)
 
     # 2. Setup ADC Config Register for Stability
-    # Bits 0 -> 2: AVG (256 samples) = 101
+    # Bits 0 -> 2: AVG (64 samples) = 011
     # Bits 3 - 5: VTCT (1.052ms) = 0b101
     # Bits 6 -> 8: VSHCT (1.052ms)   = 0b101
     # bits 9 -> 11: VBUSCT (1.052ms)  = 0b101
     # Bits 12 -> 15: MODE (Continuous) = 0b1111
     # Total ADC_CFG Value = 0xFB6D
     # Default is 0xFCDH which sets AVG to 1 sample
-    adc_config_val = 0xDFAC # 4.12ms conversion times, 64x sampling, disable temp
-    bus.write_word_data(addr, REG_ADC_CONFIG, adc_config_val)
+
+    # Note, 4.120ms conversion times sometimes don't play nicely with
+    # the 5v step down transformer, so it is best to just stick with
+    # the default 1.052ms and bump the number of samples up.
+    adc_config_val = 0xBB6E # bus and shunt only, 1.052ms conversion times, 128x sampling
+
+    # deal with the big-endian vs little-endian issue
+    swapped_value = ((adc_config_val & 0xFF) << 8) | ((adc_config_val >> 8) & 0xFF)
+    bus.write_word_data(addr, REG_ADC_CONFIG, swapped_value)
     time.sleep(0.01)
 
 
@@ -268,7 +309,7 @@ def get_outbound_ip():
         s.connect(("8.8.8.8", 80))
         ip = s.getsockname()[0]
     except Exception:
-        ip = "127.0.0.1"
+        ip = "No Network"
     finally:
         s.close()
     return ip
@@ -328,7 +369,7 @@ def battery_monitor_thread():
             with open(STATUS_FILE, "w", encoding="utf-8") as file:
                 json.dump(batt_status, file)
 
-            time.sleep(1)
+            time.sleep(2)
 
     except KeyboardInterrupt:
         print("\nMeasurement stopped.")
@@ -507,7 +548,7 @@ async def ws_status_monitor():
                                         else:
                                             line = line + "C"
                                 else:
-                                    line = f"R{i + 1} ERROR"
+                                    line = f"R{i + 1} Connecting..."
 
                             lcd_write(0, i + 2, f"{line:20}")
 
