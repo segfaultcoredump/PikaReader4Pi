@@ -13,13 +13,12 @@ a local [PikaReader](https://github.com/PikaTimer/PikaReader) instance
 
 ## Installation: 
 * Setup Raspberry Pi (Instructions TBD)
-* Install/Configure [PikaReader](https://github.com/PikaTimer/PikaReader) 0.7 or newer
+* Install/Configure [PikaReader](https://github.com/PikaTimer/PikaReader) 1.0 or newer
 * Install PikaReader4Pi
-* Review the PikaReader4Pi python script and update the GPIO and OS commands portion
-* Setup systemd to auto-start PikaReader4Pi
+* Run the PikaReader4Pi.py script and then review the config file at ~/.PikaReader4Pi.cfg to update the GPIO and OS commands as needed
+* Setup systemd to auto-start PikaReader4Pi upon boot
 
 ## Usage:
-* Python Script should auto-start via systemd (See Installation)
 * Press reading button to start reader
 * Press and hold the reading button for 3+ seconds to stop the reader
 * Press the trigger button to create a 'trigger' in the chip feed
@@ -31,7 +30,6 @@ a local [PikaReader](https://github.com/PikaTimer/PikaReader) instance
 # Required Python Libraries:
 * socket
 * asyncio
-* collections
 * time
 * websockets 
 * json
@@ -41,4 +39,6 @@ a local [PikaReader](https://github.com/PikaTimer/PikaReader) instance
 * threading 
 * requests
 * numpy
+* tomlkit
+* pathlib
 

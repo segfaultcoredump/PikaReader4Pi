@@ -6,8 +6,7 @@
 # Retrieved in 2026 from http://wiki.sunfounder.cc/index.php?title=I2C_LCD2004
 #
 # The create_char() method was added by John Garner
-# based on reading the datasheet
-# and inspired by / borrowed from the adafruit character lcd module
+# based on reading the datasheet and inspired by / borrowed from the adafruit character lcd module
 # at https://docs.circuitpython.org/projects/charlcd/en/latest/_modules/adafruit_character_lcd/character_lcd.html#Character_LCD.create_char
 #
 
